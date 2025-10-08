@@ -1,0 +1,7 @@
+[run]
+source = app
+omit =
+    app/database.py
+
+[report]
+show_missing = true
