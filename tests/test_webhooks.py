@@ -36,3 +36,13 @@ def test_data_accepts_list():
 def test_missing_idempotency_key_raises():
     with pytest.raises(ValidationError):
         InboundPayload(data={"type": "ping"})
+
+
+def test_data_accepts_string():
+    p = InboundPayload(idempotency_key="k-006", data="raw-string")
+    assert p.data == "raw-string"
+
+
+def test_data_accepts_none():
+    p = InboundPayload(idempotency_key="k-007", data=None)
+    assert p.data is None
