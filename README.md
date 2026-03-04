@@ -1,6 +1,6 @@
 # Webhook Relay & Event Inbox
 
-A backend service for receiving, persisting, and reliably delivering inbound webhook events. Events are durably written to PostgreSQL before acknowledgement. Delivery to configured destination URLs is handled asynchronously with retry logic, idempotency enforcement, and a full audit trail of every attempt.
+Receives inbound webhooks, writes them durably to PostgreSQL, and delivers them to configured destinations. Every event is persisted before the `202` goes back to the caller. Retries, idempotency dedup, and a full audit trail are built in.
 
 **Stack:** Python 3 · FastAPI · asyncpg · PostgreSQL · k6
 
@@ -15,46 +15,40 @@ A backend service for receiving, persisting, and reliably delivering inbound web
 | Idempotency deduplication by `(api_key, idempotency_key)` | **Implemented** |
 | Durable event persistence before acknowledgement | **Implemented** |
 | Append-only audit log (`audit_log` table) | **Implemented** |
-| Async delivery worker with exponential backoff | Planned |
-| Configurable retry ceiling | Planned |
-| Rate limiting per API key (ingestion) and per destination (delivery) | Planned |
-| Manual event replay / redelivery | Planned |
 | Liveness probe (`GET /healthz`) | **Implemented** |
 | Readiness probe (`GET /readyz` — verifies DB pool) | **Implemented** |
 | k6 load tests (smoke, sustained, spike) | **Implemented** |
 | Ops scripts: audit log export, event export, metrics snapshot, replay, k6 summary | **Implemented** |
+| Async delivery worker with exponential backoff | Planned |
+| Configurable retry ceiling | Planned |
+| Rate limiting per API key and per destination | Planned |
+| Manual event replay / redelivery | Planned |
 
 ---
 
 ## Local Setup
 
-### Option A — Docker Compose (recommended)
+### Docker Compose (recommended)
 
 ```bash
-cp .env.example .env          # then edit .env and set POSTGRES_PASSWORD
-docker compose up --build
+cp .env.example .env
+docker compose -p centerbridge up --build
 ```
 
-| Service | Host address |
-|---------|-------------|
+| Service | Host |
+|---------|------|
 | API | http://localhost:8001 |
-| PostgreSQL | localhost:5433 |
+| PostgreSQL | localhost:5433 (container: `db:5432`) |
 
-The database schema is applied automatically from `db/init.sql` on first start.
+Schema is applied from `db/init.sql` on first start. `dev-key-1` is seeded automatically.
 
-### Option B — manual (venv + local PostgreSQL)
-
-#### 1. Python environment
+### Manual (venv + local PostgreSQL)
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
 
-#### 2. Start PostgreSQL
-
-```bash
 docker run -d \
   --name webhook-relay-db \
   -e POSTGRES_USER=relay \
@@ -62,18 +56,12 @@ docker run -d \
   -e POSTGRES_DB=webhook_relay \
   -p 5433:5432 \
   postgres:16
-```
 
-#### 3. Run the application
-
-```bash
-DATABASE_URL=postgres://relay:relay@localhost:5433/webhook_relay \
+DATABASE_URL=postgresql://relay:relay@localhost:5433/webhook_relay \
   uvicorn app.main:app --reload --port 8001
 ```
 
-The app starts on **http://localhost:8001**.
-
-> `DATABASE_URL` is required. The app exits at startup if the variable is not set.
+> `DATABASE_URL` is required — the app exits at startup if it's not set.
 
 ---
 
@@ -82,103 +70,101 @@ The app starts on **http://localhost:8001**.
 | Endpoint | Purpose | Healthy response |
 |---|---|---|
 | `GET /healthz` | Liveness — process is alive | `200 {"status": "ok"}` |
-| `GET /readyz` | Readiness — DB pool is up and responsive | `200 {"status": "ok"}` |
+| `GET /readyz` | Readiness — DB pool is responsive | `200 {"status": "ok"}` |
 
 ```bash
 curl http://localhost:8001/healthz
 curl http://localhost:8001/readyz
 ```
 
-`/readyz` returns `503` if the DB pool is unavailable.
+`/readyz` returns `503` if the DB pool is down.
 
 ---
 
-## Load Tests (k6)
+## Ingestion
 
-> Requires [k6](https://k6.io/docs/get-started/installation/) and a running instance with the ingestion endpoint available (see planned features above).
-
-All tests require an `API_KEY` environment variable. Pass `TARGET_URL` to target port 8001 (the k6 scripts default to 8000).
-
-Results are written to `out/` by convention — create it first:
+### Send an event
 
 ```bash
-mkdir -p out
+curl -s -X POST http://localhost:8001/webhooks/inbound \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-key-1" \
+  -d '{"idempotency_key":"evt-001","data":{"hello":"world"}}' | jq .
 ```
 
-### Smoke — basic correctness at low load
-
-10 VUs · 10 seconds · thresholds: <1% errors, p95 <500 ms
-
-```bash
-k6 run \
-  -e API_KEY=$API_KEY \
-  -e TARGET_URL=http://localhost:8001/webhooks/inbound \
-  --summary-export=out/smoke_$(date +%Y-%m-%d).json \
-  k6/smoke.js
+```json
+{ "event_id": "<uuid>", "duplicate": false }
 ```
 
-### Sustained — steady traffic at expected peak
-
-50 VUs · 2 minutes · thresholds: <5% errors, p95 <500 ms
+### Same call again — idempotency
 
 ```bash
-k6 run \
-  -e API_KEY=$API_KEY \
-  -e TARGET_URL=http://localhost:8001/webhooks/inbound \
-  --summary-export=out/sustained_$(date +%Y-%m-%d).json \
-  k6/sustained.js
+curl -s -X POST http://localhost:8001/webhooks/inbound \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-key-1" \
+  -d '{"idempotency_key":"evt-001","data":{"hello":"world"}}' | jq .
 ```
 
-### Spike — burst at 5× peak load
+Same `event_id` comes back, no second row written:
 
-Ramps 0 → 250 VUs, holds 60 s, ramps back down (~2m10s total). Validates that rate limiting engages and the service recovers cleanly.
-
-```bash
-k6 run \
-  -e API_KEY=$API_KEY \
-  -e TARGET_URL=http://localhost:8001/webhooks/inbound \
-  --summary-export=out/spike_$(date +%Y-%m-%d).json \
-  k6/spike.js
+```json
+{ "event_id": "<same-uuid>", "duplicate": true }
 ```
 
-### Convert a result to a Markdown summary
+### Bad key — rejected before any DB write
 
 ```bash
-./scripts/summarize_k6_results.sh \
-  --input  out/sustained_$(date +%Y-%m-%d).json \
-  --output out/sustained_summary_$(date +%Y-%m-%d).md \
-  --label  "Sustained Load — $(date +%Y-%m-%d)"
+curl -s -X POST http://localhost:8001/webhooks/inbound \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: bad-key" \
+  -d '{"idempotency_key":"x","data":{}}' | jq .
+# → 401 {"detail":"Invalid or disabled API key"}
 ```
 
 ---
 
-## Evidence & Ops Scripts
+## Evidence & Ops
 
-All scripts in `scripts/` read `DATABASE_URL` from the environment. Outputs go to `out/` by convention.
+### Capture evidence
 
 ```bash
-mkdir -p out
-export DATABASE_URL=postgres://relay:relay@localhost:5432/webhook_relay
+make evidence
 ```
 
-### Export delivery attempt audit log (CSV)
+Writes five timestamped files to `out/evidence/` and generates `out/evidence/checksums.sha256`. `out/` is in `.gitignore` — nothing here gets committed.
+
+| File | Contents |
+|---|---|
+| `compose_ps.txt` | Container status |
+| `api_logs_tail.txt` | Last 120 API log lines |
+| `idempotency_proof.txt` | `events` grouped by `(api_key, idempotency_key)` — `row_count` must be 1 for every pair |
+| `audit_log_tail.txt` | Last 20 `audit_log` rows, actor masked |
+| `api_keys_inventory.txt` | All `api_keys` rows, key values masked to last 4 chars |
+
+### Pre-push scrub
 
 ```bash
+make scrub
+```
+
+Scans filenames and file contents for policy-violating strings. Exits non-zero on any hit.
+
+### Export audit log (CSV)
+
+```bash
+export DATABASE_URL=postgresql://relay:relay@localhost:5433/webhook_relay
+
 ./scripts/export_audit_log.sh \
   --from   2026-01-01T00:00:00Z \
   --to     2026-02-24T23:59:59Z \
   --output out/audit_log.csv
+
+shasum -a 256 out/audit_log.csv > out/audit_log.csv.sha256
 ```
 
 Optional `--status` filter: `pending` · `succeeded` · `failed` · `dead_lettered`
 
-Generate a chain-of-custody checksum after export:
-
-```bash
-sha256sum out/audit_log.csv > out/audit_log.csv.sha256
-```
-
-### Export event receipt records (CSV)
+### Export event records (CSV)
 
 ```bash
 ./scripts/export_events.sh \
@@ -187,37 +173,37 @@ sha256sum out/audit_log.csv > out/audit_log.csv.sha256
   --output out/events.csv
 ```
 
-Add `--include-payload` to include raw webhook payloads (handle under appropriate data controls).
+Add `--include-payload` to include raw payloads.
 
-### Capture a metrics snapshot (JSON)
+---
 
-```bash
-METRICS_ENDPOINT=http://localhost:9090 \
-  ./scripts/export_metrics.sh \
-  --output out/metrics_$(date +%Y%m%d_%H%M%S).json
-```
+## Load Tests (k6)
 
-### Manual event replay
-
-Single event:
+Requires [k6](https://k6.io/docs/get-started/installation/) and a running stack.
 
 ```bash
-ADMIN_API_URL=https://internal.example.com \
-ADMIN_API_TOKEN=<token> \
-  ./scripts/replay_event.sh \
-  --event-id <uuid>
-```
+mkdir -p out
 
-Batch replay by source, status, and time window:
+# Smoke — 10 VUs · 10 s · <1% errors · p95 <500 ms
+k6 run \
+  -e API_KEY=dev-key-1 \
+  -e TARGET_URL=http://localhost:8001/webhooks/inbound \
+  --summary-export=out/smoke_$(date +%Y-%m-%d).json \
+  k6/smoke.js
 
-```bash
-ADMIN_API_URL=https://internal.example.com \
-ADMIN_API_TOKEN=<token> \
-  ./scripts/replay_event.sh \
-  --source-id <id> \
-  --status    dead_lettered \
-  --from      2026-01-01T00:00:00Z \
-  --to        2026-02-24T23:59:59Z
+# Sustained — 50 VUs · 2 min · <5% errors · p95 <500 ms
+k6 run \
+  -e API_KEY=dev-key-1 \
+  -e TARGET_URL=http://localhost:8001/webhooks/inbound \
+  --summary-export=out/sustained_$(date +%Y-%m-%d).json \
+  k6/sustained.js
+
+# Spike — ramp to 250 VUs · ~2m10s total
+k6 run \
+  -e API_KEY=dev-key-1 \
+  -e TARGET_URL=http://localhost:8001/webhooks/inbound \
+  --summary-export=out/spike_$(date +%Y-%m-%d).json \
+  k6/spike.js
 ```
 
 ---
@@ -225,11 +211,13 @@ ADMIN_API_TOKEN=<token> \
 ## Repository Layout
 
 ```
-app/          FastAPI application (entry point, DB pool, health endpoints)
-docs/         Operational runbook, executive summary, evidence index
-incidents/    Incident simulation drill outputs
-k6/           Load test scripts and results
-scripts/      Evidence export and ops automation
+app/          FastAPI app — entry point, DB pool, health, ingestion
+db/           init.sql applied on first container start
+docs/         Runbook, executive summary, evidence index
+incidents/    Incident drill outputs
+k6/           Load test scripts
+scripts/      Evidence capture, export, and ops
+Makefile      evidence and scrub targets
 ```
 
 ---
@@ -238,6 +226,6 @@ scripts/      Evidence export and ops automation
 
 | Document | Purpose |
 |---|---|
-| `docs/EXEC_SUMMARY.md` | Architecture overview, risk controls, and compliance posture |
-| `docs/RUNBOOK.md` | Health checks, alerting thresholds, incident response, evidence collection |
+| `docs/EXEC_SUMMARY.md` | Architecture, risk controls, compliance posture |
+| `docs/RUNBOOK.md` | Health checks, incident response, evidence collection |
 | `docs/EVIDENCE_INDEX.md` | Compliance artifacts checklist with file paths |

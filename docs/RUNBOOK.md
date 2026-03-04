@@ -2,66 +2,81 @@
 
 **Document Owner:** Engineering
 **Classification:** Internal — Confidential
-**Last Reviewed:** 2026-02-24
+**Last Reviewed:** 2026-03-04
 
 ---
 
-## 1. System Health Verification
+## 0. Starting the Stack
 
-Run these checks at the start of any on-call shift, after a deployment, or when an alert fires.
+```bash
+cp .env.example .env          # first time only
+docker compose -p centerbridge up --build
+```
+
+| Service | Host | Container |
+|---------|------|-----------|
+| API | http://localhost:8001 | port 8000 |
+| PostgreSQL | localhost:5433 | `db:5432` |
+
+---
+
+## 1. Health Verification
+
+Run after every deployment, at shift start, or when an alert fires.
 
 ### 1.1 Liveness and Readiness
 
 ```bash
-# Service is alive
 curl -sf http://localhost:8001/healthz && echo "OK"
-
-# Service is ready (DB connection pool reachable and responsive)
 curl -sf http://localhost:8001/readyz && echo "OK"
 ```
 
-Expected: HTTP 200 with `{"status":"ok"}`. Any non-200 or connection refused is an incident.
+Both should return `200 {"status":"ok"}`. Non-200 or connection refused is an incident.
 
-### 1.2 Queue Depth
+### 1.2 Recent Ingestion Rate
 
 ```sql
--- Events received but not yet successfully delivered
+SELECT COUNT(*) AS recent_events
+FROM events
+WHERE created_at > NOW() - INTERVAL '5 minutes';
+```
+
+Compare against expected upstream send rate. Zero for 5+ minutes during business hours needs investigation.
+
+### 1.3 Idempotency Check
+
+```sql
+-- should always return zero rows
+SELECT api_key, idempotency_key, COUNT(*) AS row_count
+FROM events
+GROUP BY api_key, idempotency_key
+HAVING COUNT(*) > 1;
+```
+
+### 1.4 Recent Audit Activity
+
+```sql
+SELECT ts, action, entity_id, request_id
+FROM audit_log
+WHERE ts > NOW() - INTERVAL '5 minutes'
+ORDER BY ts DESC
+LIMIT 50;
+```
+
+### 1.5 Queue Depth and Delivery Success Rate
+
+> Applies once the async delivery worker is deployed.
+
+```sql
+-- pending deliveries
 SELECT COUNT(*) AS pending_deliveries
 FROM delivery_attempts
 WHERE status = 'pending'
    OR (status = 'failed' AND attempt_number < max_attempts);
 ```
 
-Expected: queue drains to near-zero within 60 seconds of ingestion under normal load. Sustained depth above 500 warrants investigation.
-
-### 1.3 Retry Backlog
-
 ```sql
--- Events that have exhausted retries (dead-lettered)
-SELECT source_id, COUNT(*) AS dead_letter_count
-FROM delivery_attempts
-WHERE status = 'failed' AND attempt_number >= max_attempts
-  AND created_at > NOW() - INTERVAL '24 hours'
-GROUP BY source_id
-ORDER BY dead_letter_count DESC;
-```
-
-Expected: zero in steady state. Any non-zero result requires operator review and may require manual replay.
-
-### 1.4 Recent Ingestion Rate
-
-```sql
--- Events received in last 5 minutes
-SELECT COUNT(*) AS recent_events
-FROM events
-WHERE created_at > NOW() - INTERVAL '5 minutes';
-```
-
-Cross-reference against expected upstream send rate. A drop to zero during business hours is an alert condition.
-
-### 1.5 Delivery Success Rate (Last Hour)
-
-```sql
+-- success rate last hour
 SELECT
   status,
   COUNT(*) AS count,
@@ -71,27 +86,21 @@ WHERE created_at > NOW() - INTERVAL '1 hour'
 GROUP BY status;
 ```
 
-Expected: `succeeded` >= 98%. Failure rate above 5% sustained for more than 10 minutes is an incident.
+Target: `succeeded` >= 98%. Failure rate above 5% for more than 10 minutes is an incident.
 
 ---
 
-## 2. Logs and Metrics to Check
+## 2. Logs and Metrics
 
-### 2.1 Structured Log Fields
-
-All application log lines are emitted as JSON. Key fields to filter on:
+### 2.1 Audit Log Fields
 
 | Field | What to look for |
 |-------|-----------------|
-| `request_id` | Trace a single event end-to-end across all log lines |
-| `source_id` | Filter activity for a specific upstream sender |
-| `event` | `ingestion.received`, `ingestion.duplicate`, `delivery.attempt`, `delivery.succeeded`, `delivery.failed`, `delivery.dead_lettered`, `rate_limit.enforced` |
-| `attempt_number` | Values > 3 indicate persistent delivery problems |
-| `http_status` | Non-2xx from destination URLs |
-| `duration_ms` | p95 above 2000 ms on ingestion or delivery warrants review |
-| `idempotency_key` | Presence of `ingestion.duplicate` events at unexpected volume may indicate upstream retry storms |
-
-**Sample query against the audit_log table:**
+| `request_id` | Trace a single event end-to-end |
+| `actor` | API key (masked) that submitted the request |
+| `action` | `ingest.received`, `ingest.duplicate` |
+| `entity_id` | UUID of the affected event |
+| `idempotency_key` | Spike in `ingest.duplicate` may indicate an upstream retry storm |
 
 ```sql
 SELECT ts, action, actor, entity_id, request_id
@@ -102,47 +111,40 @@ ORDER BY ts DESC
 LIMIT 100;
 ```
 
-### 2.2 Metrics to Check
+### 2.2 Alert Thresholds
 
-| Metric | Alert Threshold | Notes |
-|--------|----------------|-------|
-| `webhook.ingestion.rate` | < 0 events/min sustained 5 min during business hours | Possible upstream outage or auth key revocation |
-| `webhook.delivery.success_rate` | < 95% over 10 min window | Destination URL unreachable or returning errors |
-| `webhook.queue.depth` | > 1000 pending | Worker may be stalled or under-provisioned |
-| `webhook.retry.dead_letter_count` | > 0 in any 1 hour window | Manual review and possible replay required |
-| `webhook.rate_limit.enforced_count` | Spike > 50/min from a single source | Potential misconfigured or misbehaving sender |
-| `http.p95_latency_ms` (ingestion) | > 500 ms | DB write bottleneck or connection pool exhaustion |
+| Metric | Threshold | Notes |
+|--------|-----------|-------|
+| Ingestion rate | Zero for 5 min during business hours | Upstream outage or key revoked |
+| Delivery success rate | < 95% over 10 min | Destination unreachable |
+| Queue depth | > 1000 pending | Worker stalled or under-provisioned |
+| Dead-letter count | > 0 per hour | Manual review required |
+| Ingestion p95 latency | > 500 ms | DB bottleneck or pool exhaustion |
 
 ---
 
 ## 3. Incident Response
 
-### 3.1 Delivery Worker Stalled (Queue Depth Growing, No Deliveries)
+### 3.1 Delivery Worker Stalled
 
-**Detection:** Queue depth metric rising; `delivery.attempt` log events absent; `delivery.succeeded` counter flat.
+> Applies once the async delivery worker is deployed.
 
-**Steps:**
-1. Check worker process health: `ps aux | grep worker` or check the process supervisor / container status.
+**Signs:** queue depth growing, no delivery audit events, succeeded counter flat.
+
+1. Check worker process: `ps aux | grep worker` or inspect the container.
 2. Check worker logs for panic, OOM, or unhandled exception.
-3. Check Postgres connectivity from the worker host:
-   ```bash
-   psql $DATABASE_URL -c "SELECT 1;"
-   ```
-4. Check destination URL reachability:
-   ```bash
-   curl -I https://destination.example.com/webhook
-   ```
-5. If worker is dead, restart it. Document restart time and cause in the incident log.
-6. Verify queue begins draining within 2 minutes of restart.
-7. Run the retry backlog query (Section 1.3) to confirm no events were dead-lettered during the outage window.
-8. For any dead-lettered events, trigger manual replay (Section 3.4).
+3. Check DB connectivity: `psql $DATABASE_URL -c "SELECT 1;"`
+4. Check destination reachability: `curl -I https://destination.example.com/webhook`
+5. Restart if dead. Note restart time in the incident log.
+6. Confirm queue starts draining within 2 minutes.
 
-### 3.2 Elevated Delivery Failure Rate (Destination Returning Errors)
+### 3.2 Elevated Delivery Failure Rate
 
-**Detection:** `delivery.failed` log events; HTTP status 4xx or 5xx in delivery attempt logs; success rate metric below threshold.
+> Applies once the async delivery worker is deployed.
 
-**Steps:**
-1. Identify the failing destination:
+**Signs:** 4xx/5xx in delivery logs, success rate below threshold.
+
+1. Find the failing destination:
    ```sql
    SELECT destination_url, http_status, COUNT(*)
    FROM delivery_attempts
@@ -150,38 +152,34 @@ LIMIT 100;
    GROUP BY destination_url, http_status
    ORDER BY COUNT(*) DESC;
    ```
-2. Confirm whether the destination is externally reachable. Contact the destination team if needed.
-3. Do not manually replay until the destination confirms it is healthy — replaying into a broken destination generates additional failed attempts and may exhaust retry budget.
-4. Once destination is healthy, replay affected events using the procedure in Section 3.4.
-5. Confirm delivery attempts succeed post-replay.
+2. Check whether the destination is reachable. Contact that team if not.
+3. Don't replay until the destination is confirmed healthy — replaying into a broken endpoint burns retry budget.
+4. Once healthy, replay via Section 3.4.
 
-### 3.3 Duplicate Events Arriving at Unexpected Volume
+### 3.3 Duplicate Storm
 
-**Detection:** `ingestion.duplicate` log event count spikes; same idempotency key appearing multiple times in `events` table.
+**Signs:** `ingest.duplicate` audit rows spiking.
 
-**Steps:**
-1. Identify the source:
+1. Find the source:
    ```sql
-   SELECT api_key, idempotency_key, COUNT(*) AS duplicate_count
+   SELECT actor, idempotency_key, COUNT(*) AS duplicate_count
    FROM audit_log
    WHERE action = 'ingest.duplicate'
      AND ts > NOW() - INTERVAL '1 hour'
-   GROUP BY api_key, idempotency_key
+   GROUP BY actor, idempotency_key
    ORDER BY duplicate_count DESC;
    ```
-2. Confirm idempotency deduplication is suppressing reprocessing (check that downstream delivery count matches expected, not raw ingestion count).
-3. Notify the upstream source team of their retry storm. No corrective action on the relay is required if deduplication is functioning correctly.
-4. Document volume, source, and duration for the incident record.
+2. Verify dedup is working: delivery count should match original ingestion count, not raw submission count.
+3. Notify the upstream team — no relay-side action needed if dedup is functioning.
+4. Document volume, source, and duration.
 
-### 3.4 Manual Event Replay
-
-Use the replay procedure when events must be redelivered after a destination outage or mis-configuration.
+### 3.4 Manual Replay
 
 ```bash
-# Replay a single event by event ID
+# single event
 ./scripts/replay_event.sh --event-id <uuid> --destination-url <url>
 
-# Replay all dead-lettered events for a source in a time window
+# batch by source and time window
 ./scripts/replay_event.sh \
   --source-id <source_id> \
   --status dead_lettered \
@@ -189,81 +187,71 @@ Use the replay procedure when events must be redelivered after a destination out
   --to   "2026-02-24T06:00:00Z"
 ```
 
-Each replay creates a new delivery attempt record. The original event record is not modified. Confirm successful delivery by querying:
-
-```sql
-SELECT event_id, attempt_number, status, http_status, created_at
-FROM delivery_attempts
-WHERE event_id = '<uuid>'
-ORDER BY created_at DESC;
-```
-
 ### 3.5 Unauthorized Ingestion Attempt
 
-**Detection:** HTTP 401 responses on `POST /webhooks/inbound`; no `audit_log` row written (auth is rejected before any DB write).
+**Signs:** HTTP 401 on `POST /webhooks/inbound`. Auth is rejected before any DB write, so no `audit_log` row will exist for the request.
 
-**Steps:**
-1. Identify the source IP and claimed source identifier from logs.
-2. Confirm no data was written (auth rejection occurs before any database write).
-3. If attempts are sustained, apply IP-level block at the gateway or firewall layer.
-4. Escalate to the security team if the source identity suggests a leaked or compromised API key.
-5. Rotate the affected API key immediately if compromise is suspected. Key rotation does not affect already-persisted events.
+1. Identify the source IP and claimed key from logs.
+2. Confirm no data was written.
+3. Block at the gateway if attempts are sustained.
+4. Escalate to security if a key compromise is suspected.
+5. Rotate the affected key immediately. Already-persisted events are unaffected.
 
 ---
 
 ## 4. Evidence Collection
 
-Run these steps to produce a complete, timestamped evidence package for a regulatory request, audit, or post-incident review.
-
-### 4.1 Export Audit / Delivery Attempt Log
+### 4.1 Quick Capture
 
 ```bash
-# Exports all delivery attempts for a date range to a signed, timestamped CSV
+make evidence
+```
+
+Writes to `out/evidence/` (gitignored — local only, never committed) and produces `out/evidence/checksums.sha256`.
+
+| File | Contents |
+|---|---|
+| `compose_ps.txt` | Container status at capture time |
+| `api_logs_tail.txt` | Last 120 API log lines |
+| `idempotency_proof.txt` | `events` grouped by `(api_key, idempotency_key)` — `row_count = 1` for all entries |
+| `audit_log_tail.txt` | Last 20 `audit_log` rows, actor masked |
+| `api_keys_inventory.txt` | All `api_keys` rows, key masked to last 4 chars |
+
+### 4.2 Export Audit Log (CSV)
+
+```bash
+export DATABASE_URL=postgresql://relay:relay@localhost:5433/webhook_relay
+
 ./scripts/export_audit_log.sh \
   --from "2026-01-01T00:00:00Z" \
   --to   "2026-02-24T23:59:59Z" \
-  --output docs/evidence/audit_log_2026-01-01_to_2026-02-24.csv
+  --output out/audit_log_2026-01-01_to_2026-02-24.csv
 
-# Produce a SHA-256 checksum of the export for chain-of-custody
-sha256sum docs/evidence/audit_log_2026-01-01_to_2026-02-24.csv \
-  > docs/evidence/audit_log_2026-01-01_to_2026-02-24.csv.sha256
+shasum -a 256 out/audit_log_2026-01-01_to_2026-02-24.csv \
+  > out/audit_log_2026-01-01_to_2026-02-24.csv.sha256
 ```
 
-Fields included in export: `event_id`, `source_id`, `destination_url`, `attempt_number`, `http_status`, `status`, `duration_ms`, `created_at`, `request_id`.
-
-### 4.2 Export Raw Event Records
+### 4.3 Export Event Records (CSV)
 
 ```bash
-# Export raw event metadata (no payload data unless specifically required)
 ./scripts/export_events.sh \
   --from "2026-01-01T00:00:00Z" \
   --to   "2026-02-24T23:59:59Z" \
-  --output docs/evidence/events_2026-01-01_to_2026-02-24.csv
+  --output out/events_2026-01-01_to_2026-02-24.csv
 ```
 
-### 4.3 Capture Metric Snapshots
+### 4.4 Metrics Snapshot
 
 ```bash
-# Export current metric values to a JSON snapshot
-./scripts/export_metrics.sh --output docs/evidence/metrics_snapshot_$(date +%Y%m%d_%H%M%S).json
+./scripts/export_metrics.sh \
+  --output out/metrics_snapshot_$(date +%Y%m%d_%H%M%S).json
 ```
 
-### 4.4 Export Incident Simulation Reports
-
-Incident simulation outputs are stored in `incidents/`. Each file is named by drill date and scenario:
-
-```
-incidents/YYYY-MM-DD_<scenario>.md
-```
-
-Copy relevant files to `docs/evidence/` before packaging for examiner delivery.
-
-### 4.5 Package Evidence Archive
+### 4.5 Package for Delivery
 
 ```bash
-# Create a timestamped, compressed archive of all evidence
-tar -czf evidence_package_$(date +%Y%m%d_%H%M%S).tar.gz docs/evidence/
-sha256sum evidence_package_*.tar.gz > evidence_package_checksums.sha256
+tar -czf out/evidence_package_$(date +%Y%m%d_%H%M%S).tar.gz out/evidence/
+shasum -a 256 out/evidence_package_*.tar.gz > out/evidence_package_checksums.sha256
 ```
 
-Retain both the archive and its checksum file. Provide both to the requesting examiner. Do not transmit the archive over unencrypted channels.
+Keep both the archive and its checksum. Send over encrypted channels only; log the timestamp and recipient.

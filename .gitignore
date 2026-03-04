@@ -6,3 +6,19 @@ __pycache__/
 k6/results/
 out/
 .env
+
+# local env / tooling
+.env
+.venv/
+.claude/
+
+# build/output
+out/
+k6/results/
+
+# python
+__pycache__/
+.pytest_cache/
+
+# mac
+.DS_Store

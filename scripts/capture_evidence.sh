@@ -153,6 +153,3 @@ ORDER BY name;
 echo ""
 echo "Artifacts written:"
 ls -lh "${OUT_DIR}"
-echo ""
-echo "Generate chain-of-custody checksums:"
-echo "  sha256sum ${OUT_DIR}/*.txt > ${OUT_DIR}/checksums.sha256"
