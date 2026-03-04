@@ -1,0 +1,8 @@
+.venv/
+.claude/
+__pycache__/
+.pytest_cache/
+.DS_Store
+k6/results/
+out/
+.env
