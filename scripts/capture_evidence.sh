@@ -9,7 +9,7 @@
 #   ./scripts/capture_evidence.sh [--project <compose-project-name>]
 #
 # Options:
-#   --project   Docker Compose project name (default: centerbridge)
+#   --project   Docker Compose project name (default: webhook-relay)
 #
 # Requirements:
 #   docker      Docker CLI with Compose plugin (no psql or DATABASE_URL needed;
@@ -27,7 +27,7 @@ OUT_DIR="${REPO_ROOT}/out/evidence"
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-PROJECT="centerbridge"
+PROJECT="webhook-relay"
 
 # ---------------------------------------------------------------------------
 # Helpers

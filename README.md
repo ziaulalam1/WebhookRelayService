@@ -32,7 +32,7 @@ Receives inbound webhooks, writes them durably to PostgreSQL, and delivers them 
 
 ```bash
 cp .env.example .env
-docker compose -p centerbridge up --build
+docker compose -p webhook-relay up --build
 ```
 
 | Service | Host |

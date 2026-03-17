@@ -19,7 +19,7 @@ Run `scripts/capture_evidence.sh` to produce all five snapshot artifacts in a si
 
 ```bash
 mkdir -p out/evidence
-./scripts/capture_evidence.sh          # uses project name "centerbridge" by default
+./scripts/capture_evidence.sh          # uses project name "webhook-relay" by default
 ./scripts/capture_evidence.sh --project <name>   # override if compose project differs
 ```
 

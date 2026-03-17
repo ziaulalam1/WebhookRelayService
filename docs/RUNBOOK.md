@@ -10,7 +10,7 @@
 
 ```bash
 cp .env.example .env          # first time only
-docker compose -p centerbridge up --build
+docker compose -p webhook-relay up --build
 ```
 
 | Service | Host | Container |
