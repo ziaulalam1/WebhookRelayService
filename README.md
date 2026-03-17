@@ -2,6 +2,8 @@
 
 Receives inbound webhooks, writes them durably to PostgreSQL, and delivers them to configured destinations. Every event is persisted before the `202` goes back to the caller. Retries, idempotency dedup, and a full audit trail are built in.
 
+Reliable event ingestion matters more when downstream consumers are non-deterministic — if an AI pipeline, async worker, or external model processes an event twice or misses one, the error is silent and hard to trace. This service makes the ingestion layer the one thing you can trust.
+
 **Stack:** Python 3 · FastAPI · asyncpg · PostgreSQL · k6
 
 ---
